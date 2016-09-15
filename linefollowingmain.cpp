@@ -11,6 +11,8 @@
 #include "tb6612fng.h"
 #include "user_pb.h"
 #include "green_leds.h"
+#include "derivative_filter.h"
+#include "encoder.h"
 
 //----- GLOBAL OBJECTS ------------------------------------------------------------------
 // the global object "systick_timer" is defined in systick_timer.cpp
@@ -23,102 +25,72 @@ float left_distance = 0.0f, right_distance = 0.0f;
 float left_speed, right_speed, speed_command;
 static float error = 0.0;
 float qtr_volts[9];
+
 enum {
     forward,
     reverse,
-    stop
 } drive_mode;
 
 float kp = 3.8;
 float kd = 0.01;
 float ki = 0.4;
-
+float x_dist = 0.0f;
+float d_speed;
+float differential_speed = 0.1f;
+uint8_t stop = 0;
 
 //----- INTERNAL FUNCTION PROTOTYPES ----------------------------------------------------
 void handle_battery_leds(float batt_voltage, double time);
 float right_PID(float rerror, float DT);
 float left_PID(float rerror, float DT);
-void leds(qtr_volts[]);
+void leds_light(float qtr_volts[9]);
 
 //***************************************************************************************
 //***************************************************************************************
 int main(void)
 {
     float avg_distance;
-    hbridge.setUpdateDuty(0.95);             // These two things are needed so that the
-    TIM_ITConfig(TIM1, TIM_IT_CC3, ENABLE);  // timer updates and current sensing happens
-    drive_mode = forward;
-    speed_command = 0.0f;
-
     const float QTR_SENSOR_DISTANCE = 0.009525f;
-    uint16_t LEDS[8] = {GPIO_Pin_12,
-    GPIO_Pin_13,
-    GPIO_Pin_14,
-    GPIO_Pin_15,
-    GPIO_Pin_8,
-    GPIO_Pin_9,
-    GPIO_Pin_10,
-    GPIO_Pin_11};
-
-    float d = QTR_SENSOR_DISTANCE/2.0;
-    float d_max = d + QTR_SENSOR_DISTANCE*3.0;
-    float d_min = -d - QTR_SENSOR_DISTANCE*3.0;
-    float sum = 0.0;
-    float line_array[9] =
-    {
-    d_min,
-    -d - QTR_SENSOR_DISTANCE*2.0,
-    -d - QTR_SENSOR_DISTANCE,
-    -d,
-    0.0,
-    d,
-    d + QTR_SENSOR_DISTANCE,
-    d + QTR_SENSOR_DISTANCE*2.0,
-    d_max
-    };
-
+    speed_command = 0.0f;
     hbridge.setUpdateDuty(0.95);             // These two things are needed so that the
     TIM_ITConfig(TIM1, TIM_IT_CC3, ENABLE);  // timer updates and current sensing happens
 
     systick_timer.start();
 
     UserPushButton top_push_button(USER_PB_TOP);
+    drive_mode = forward;
     while (!top_push_button.activated());
 
     while(true)
     {
-        // GREEN LED loop. Iterates through the QTR array to determine its state and the LEDs state.
-        for (int i = 0; i < 9; ++i)
+        speed_command=1.0f;
+        if (stop > 0)
         {
-            if ((qtr_volts[i] > 2.2f) && (i < 4) )
+            speed_command = 0.0f;
+            while(!top_push_button.activated())
             {
-                GPIOB->BSRRH = LEDS[i];
-            }
-            else if ((qtr_volts[i] > 2.2f) && (i >= 4) )
-            {
-                GPIOD->BSRRH = LEDS[i];
-            }
-            if ((qtr_volts[i] < 2.2f) && (i < 4))
-            {
-                GPIOB->BSRRL = LEDS[i];
-            }
-            else if ((qtr_volts[i] < 2.2f) && (i >= 4) )
-            {
-                GPIOD->BSRRL = LEDS[i];
+                stop = 0;
             }
         }
+
+        }
     }
-}
+
 
 //***************************************************************************************
 // This function is called in an interrupt context at a freq = systick_timer.frequency()
 //***************************************************************************************
 void systick_callback(void)
 {
+    const float DT = systick_timer.period();
+    static DerivativeFilter left_derivative(DT, 50.0, 0.707);
+    static DerivativeFilter right_derivative(DT, 50.0, 0707);
+    static DerivativeFilter line_derivative(DT,50.0, 0.707);
+    static Encoder left_encoder(EncoderA);
+    static Encoder right_encoder(EncoderB);
     static AnalogIn analog_in;
     static GreenLeds gleds_light;
     analog_in.getVoltages(qtr_volts);
-
     double current_time = systick_timer.ticks()*systick_timer.period();
     float raw_voltages[9];
 
@@ -126,16 +98,15 @@ void systick_callback(void)
     float batt_voltage = BATTERY_SCALE * raw_voltages[8] + BATTERY_OFFSET;
 
     handle_battery_leds(batt_voltage, current_time);
+    leds_light(qtr_volts);
 
-    // The current sensing is messy. For accurate sensing we need a small dither on the
-    // pwm duty cycle. So these measurements are rough
     left_motor_current = hbridge.getMotorACurrent()*MOTOR_SIGNS[0];
     right_motor_current = hbridge.getMotorBCurrent()*MOTOR_SIGNS[1];
+    left_speed = left_derivative.calculate(left_distance);
+    right_speed = right_derivative.calculate(right_distance);
+    left_duty = left_PID(speed_command - left_speed, DT);
+    right_duty = right_PID(speed_command - right_speed, DT);
 
-
-    // There is nothing happening in this template. Additional code is needed.
-    // It is possible to add the duty cycles to a live watch in the debugger and spin
-    // the motors.
 
     hbridge.setDutyA(left_duty*MOTOR_SIGNS[0]);
     hbridge.setDutyB(right_duty*MOTOR_SIGNS[1]);
@@ -244,4 +215,35 @@ float right_PID(float rerror, float DT)
     rerror_old = rerror;
 
     return u;
+}
+void leds_light(float qtr_volts[9])
+{
+    uint16_t LEDS[8] = {GPIO_Pin_12,
+    GPIO_Pin_13,
+    GPIO_Pin_14,
+    GPIO_Pin_15,
+    GPIO_Pin_8,
+    GPIO_Pin_9,
+    GPIO_Pin_10,
+    GPIO_Pin_11};
+    // GREEN LED loop. Iterates through the QTR array to determine its state and the LEDs state.
+    for (int i = 0; i < 9; ++i)
+    {
+        if ((qtr_volts[i] > 2.2f) && (i < 4) )
+        {
+            GPIOB->BSRRH = LEDS[i];
+        }
+        else if ((qtr_volts[i] > 2.2f) && (i >= 4) )
+        {
+            GPIOD->BSRRH = LEDS[i];
+        }
+        if ((qtr_volts[i] < 2.2f) && (i < 4))
+        {
+            GPIOB->BSRRL = LEDS[i];
+        }
+        else if ((qtr_volts[i] < 2.2f) && (i >= 4) )
+        {
+            GPIOD->BSRRL = LEDS[i];
+        }
+    }
 }
